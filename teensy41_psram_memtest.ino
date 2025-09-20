@@ -2,16 +2,33 @@
    Note that this test fails with ISSI 16MByte parts if prefetch is on
    using https://github.com/PaulStoffregen/cores/pull/708 code
    
-   Speed  prefetch Duration (16MB)
-   105.6    on       61.16
-    88.0    on       70.20
-   105.6    off      72.63
-    88.0    off      82.49
+   Speed  prefetch Duration
+   AP6404 8+8MB
+   105.6    on       61.66 (15.1% faster)
+    88.0    on       70.11
+   105.6    off      72.65
+    88.0    off      82.41 ==
+
+   ISSI 16MB
+   105.6    off      72.52
+    88.0    off      82.39 ==
+    49.5    off     125.24
+    
+   With BUFSZ(8) - test passes
+   105.6    on       67.52 (6.9% faster) 
 
    Original test passes using 16MB ISSI PSRAM
    (note different algorithm, so duration NOT comparable)
    Speed  prefetch Duration (16MB)
    105.6    on       48.19
+
+ 105.6MHz is 20% faster than 88MHz, but the test only runs ~12% faster,
+ so test overhead is slightly masking the speed increase.
+
+ The combined clock and "safe" pre-fetch changes give 16.7% speed-up,
+ but it appears that using the "unsafe" pre-fetch gives 23.8%, so
+ it may well be worthwhile selecting the pre-fetch scheme at boot time
+ depending on the parts detected.
 */
 extern "C" uint8_t external_psram_size;
 
@@ -137,6 +154,9 @@ bool new_fail_message(uint32_t* pm, volatile uint32_t *location, int count)
     location += n;
     pr += n;
     pm += n;
+
+    if (count < n)
+      n = count;
   }
   return false;
 }
@@ -245,7 +265,7 @@ bool check_lfsr_pattern(uint32_t seed)
     else
     {
       int count = memory_end - p;
-      memcpy((void*) p, regMulti, count * sizeof * p);
+      memcpy((void*) p, regMulti, count * sizeof *p);
       p += count;
     }
   }
@@ -262,19 +282,20 @@ bool check_lfsr_pattern(uint32_t seed)
     int count = memory_end - p;
 
     nextRegMulti();
-    if (count > BLK_SIZE)
+    if (count >= BLK_SIZE)
     {
-      memcpy(memBuff, (void*) p, sizeof memBuff);
-      cmpres = memcmp(memBuff, regMulti, sizeof regMulti);
-      p += sizeof regMulti / sizeof * p;
       count = BLK_SIZE;
+      const int sz = count * sizeof *p;
+      memcpy(memBuff, (void*) p, sz);
+      cmpres = memcmp(memBuff, regMulti, sz);
     }
     else
     {
-      memcpy(memBuff, (void*) p, count * sizeof * p);
-      cmpres = memcmp(memBuff, regMulti, count * sizeof * p);
-      p += count;
+      const int sz = count * sizeof *p;
+      memcpy(memBuff, (void*) p, sz);
+      cmpres = memcmp(memBuff, regMulti, sz);
     }
+    p += count;
     if (0 != cmpres) return new_fail_message(memBuff, p - count, count);
     //Serial.printf(" reg=%08X\n", reg);
   }
