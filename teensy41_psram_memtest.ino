@@ -30,6 +30,8 @@
  it may well be worthwhile selecting the pre-fetch scheme at boot time
  depending on the parts detected.
 */
+#include <Arduino.h>
+
 extern "C" uint8_t external_psram_size;
 
 bool memory_ok = false;
@@ -50,7 +52,13 @@ void setup()
     const float clocks[4] = {396.0f, 720.0f, 664.62f, 528.0f};
     const float frequency = clocks[(CCM_CBCMR >> 8) & 3] / (float)(((CCM_CBCMR >> 29) & 7) + 1);
     Serial.printf(" CCM_CBCMR=%08X (%.1f MHz)\n", CCM_CBCMR, frequency);
-    Serial.printf(" Pre-fetch is %sabled\n", (FLEXSPI2_AHBCR & FLEXSPI_AHBCR_PREFETCHEN) ? "en" : "dis");
+    Serial.printf(" Pre-fetch is %sabled", (FLEXSPI2_AHBCR & FLEXSPI_AHBCR_PREFETCHEN) ? "en" : "dis");
+    if (0 != FLEXSPI2_AHBRXBUF0CR0)
+    {
+      Serial.printf("; prefetch limited: BUFSZ=%d\n", FLEXSPI_AHBRXBUFCR0_BUFSZ(FLEXSPI2_AHBRXBUF0CR0));
+    }
+    else
+      Serial.println();
     
     memory_begin = (uint32_t *)(0x7000'0000);
     memory_end = (uint32_t *)(0x7000'0000 + size * 1'048'576);
@@ -130,16 +138,16 @@ void setup()
 uint32_t reg;
 
 #define BLK_SIZE 255 // 255*uint32_t is 1020 bytes
-uint32_t regMulti[BLK_SIZE];
+uint32_t regMulti[2][BLK_SIZE];
 
-bool new_fail_message(uint32_t* pm, volatile uint32_t *location, int count)
+bool new_fail_message(uint32_t* pm, volatile uint32_t *location, int count, int which)
 {
   //Serial.printf(" Error at %08X, read %08X but expected %08X\n",
   //  (uint32_t)location, actual, expected);
   Serial.printf("Error at %08X\n",
                 (uint32_t)location);
   int n = 16;
-  uint32_t* pr = regMulti;
+  uint32_t* pr = regMulti[which];
   //uint32_t* pm = location;
   while (count > 0)
   {
@@ -166,7 +174,8 @@ bool new_fail_message(uint32_t* pm, volatile uint32_t *location, int count)
 ///////////////////////////////////////////////////////////////////
 void nextRegFixed(uint32_t pattern)
 {
-  for (int i = 0; i < BLK_SIZE; i++) regMulti[i] = pattern;
+  for (int which = 0; which < 2; which++)
+    for (int i = 0; i < BLK_SIZE; i++) regMulti[which][i] = pattern;
 }
 
 
@@ -178,45 +187,38 @@ bool check_fixed_pattern(uint32_t pattern)
   p = memory_begin;
   nextRegFixed(pattern); // do once, value is fixed
 
+  int which = 0;
   while (p < memory_end)
   {
-    if (memory_end - p > BLK_SIZE)
-    {
-      memcpy((void*) p, regMulti, sizeof regMulti);
-      p += sizeof regMulti / sizeof * p;
-    }
-    else
-    {
-      int count = memory_end - p;
-      memcpy((void*) p, regMulti, count * sizeof * p);
-      p += count;
-    }
+    int count = memory_end - p; // words left to compare
+    if (count > BLK_SIZE)
+      count = BLK_SIZE;
+
+    memcpy((void*) p, regMulti[which], count * sizeof *p);
+
+    p += count;
+    which = 1-which;
   }
 
   arm_dcache_flush_delete((void *)memory_begin,
                           (uint32_t)memory_end - (uint32_t)memory_begin);
 
   p = memory_begin;
+  which = 0;
   while (p < memory_end)
   {
     int cmpres = 999;
     uint32_t memBuff[BLK_SIZE];
-    int count = memory_end - p;
+    int count = memory_end - p; // words left to compare
 
     if (count > BLK_SIZE)
-    {
-      memcpy(memBuff, (void*) p, sizeof memBuff);
-      cmpres = memcmp(memBuff, regMulti, sizeof regMulti);
-      p += sizeof regMulti / sizeof * p;
       count = BLK_SIZE;
-    }
-    else
-    {
-      memcpy(memBuff, (void*) p, count * sizeof * p);
-      cmpres = memcmp(memBuff, regMulti, count * sizeof * p);
-      p += count;
-    }
-    if (0 != cmpres) return new_fail_message(memBuff, p - count, count);
+    memcpy(memBuff, (void*) p, count * sizeof *p);
+    cmpres = memcmp(memBuff, regMulti[which], count * sizeof *p);
+    p += count;
+
+    if (0 != cmpres) return new_fail_message(memBuff, p - count, count, which);
+    which = 1-which;
     //Serial.printf(" reg=%08X\n", reg);
   }
 
@@ -240,34 +242,30 @@ uint32_t nextReg(void)
 }
 
 
-void nextRegMulti(void)
+void nextRegMulti(int which)
 {
   for (int i = 0; i < BLK_SIZE; i++)
-    regMulti[i] = nextReg();
+    regMulti[which][i] = nextReg();
 }
 
 
 bool check_lfsr_pattern(uint32_t seed)
 {
   volatile uint32_t *p;
+  int which = 0;
 
   Serial.printf("testing with pseudo-random sequence, seed=%u\n", seed);
   reg = seed;
   p = memory_begin;
   while (p < memory_end)
   {
-    nextRegMulti();
-    if (memory_end - p > BLK_SIZE)
-    {
-      memcpy((void*) p, regMulti, sizeof regMulti);
-      p += sizeof regMulti / sizeof * p;
-    }
-    else
-    {
-      int count = memory_end - p;
-      memcpy((void*) p, regMulti, count * sizeof *p);
-      p += count;
-    }
+    nextRegMulti(which);
+    int count = memory_end - p;
+    if (count > BLK_SIZE)
+      count = BLK_SIZE;
+    memcpy((void*) p, regMulti[which], count * sizeof *p);
+    p += count;
+    which = 1-which;
   }
 
   arm_dcache_flush_delete((void *)memory_begin,
@@ -275,28 +273,22 @@ bool check_lfsr_pattern(uint32_t seed)
 
   reg = seed;
   p = memory_begin;
+  which = 0;
   while (p < memory_end)
   {
     int cmpres = 999;
     uint32_t memBuff[BLK_SIZE];
     int count = memory_end - p;
 
-    nextRegMulti();
+    nextRegMulti(which);
     if (count >= BLK_SIZE)
-    {
       count = BLK_SIZE;
-      const int sz = count * sizeof *p;
-      memcpy(memBuff, (void*) p, sz);
-      cmpres = memcmp(memBuff, regMulti, sz);
-    }
-    else
-    {
-      const int sz = count * sizeof *p;
-      memcpy(memBuff, (void*) p, sz);
-      cmpres = memcmp(memBuff, regMulti, sz);
-    }
+    const int sz = count * sizeof *p;
+    memcpy(memBuff, (void*) p, sz);
+    cmpres = memcmp(memBuff, regMulti[which], sz);
     p += count;
-    if (0 != cmpres) return new_fail_message(memBuff, p - count, count);
+    if (0 != cmpres) return new_fail_message(memBuff, p - count, count, which);
+    which = 1-which;
     //Serial.printf(" reg=%08X\n", reg);
   }
   return true;
