@@ -31,14 +31,35 @@
  depending on the parts detected.
 */
 #include <Arduino.h>
+#include <DMAChannel.h>
 
 extern "C" uint8_t external_psram_size;
 
 bool memory_ok = false;
 uint32_t *memory_begin, *memory_end;
+int test_count;
 
-bool check_fixed_pattern(uint32_t pattern);
-bool check_lfsr_pattern(uint32_t seed);
+#define SOME_TESTS_USE_DMA true
+bool check_fixed_pattern(uint32_t pattern, bool useDMA = false);
+bool check_lfsr_pattern(uint32_t seed, bool useDMA = false);
+
+
+void printPrefetchSetting(uint32_t setting)
+{
+  if (setting & FLEXSPI_AHBRXBUFCR0_PREFETCHEN)
+  {
+    const char* master="????";
+    switch ((setting & FLEXSPI_AHBRXBUFCR0_MSTRID_MASK) / FLEXSPI_AHBRXBUFCR0_MSTRID(1))
+    {
+      case 0: master = " CPU"; break;
+      case 1: master = "eDMA"; break;
+      case 2: master = " DCP"; break;
+      default: break;
+    }
+    Serial.printf("  %s: BUFSZ=%d\n", master, FLEXSPI_AHBRXBUFCR0_BUFSZ(setting));
+  }
+}
+
 
 void setup()
 {
@@ -52,13 +73,19 @@ void setup()
     const float clocks[4] = {396.0f, 720.0f, 664.62f, 528.0f};
     const float frequency = clocks[(CCM_CBCMR >> 8) & 3] / (float)(((CCM_CBCMR >> 29) & 7) + 1);
     Serial.printf(" CCM_CBCMR=%08X (%.1f MHz)\n", CCM_CBCMR, frequency);
-    Serial.printf(" Pre-fetch is %sabled", (FLEXSPI2_AHBCR & FLEXSPI_AHBCR_PREFETCHEN) ? "en" : "dis");
-    if (0 != FLEXSPI2_AHBRXBUF0CR0)
+
+    bool prefetch = 0 != (FLEXSPI2_AHBCR & FLEXSPI_AHBCR_PREFETCHEN);
+    Serial.printf(" Pre-fetch is %sabled\n", prefetch ? "en" : "dis");
+    if (prefetch && 0 != FLEXSPI2_AHBRXBUF0CR0)
     {
-      Serial.printf("; prefetch limited: BUFSZ=%d\n", FLEXSPI_AHBRXBUFCR0_BUFSZ(FLEXSPI2_AHBRXBUF0CR0));
+      printPrefetchSetting(FLEXSPI2_AHBRXBUF0CR0);
+      printPrefetchSetting(FLEXSPI2_AHBRXBUF1CR0);
+      printPrefetchSetting(FLEXSPI2_AHBRXBUF2CR0);
+      printPrefetchSetting(FLEXSPI2_AHBRXBUF3CR0);
     }
-    else
-      Serial.println();
+    Serial.printf("%s tests use DMA memory copying",SOME_TESTS_USE_DMA?"Some":"No");
+
+    Serial.println();
     
     memory_begin = (uint32_t *)(0x7000'0000);
     memory_end = (uint32_t *)(0x7000'0000 + size * 1'048'576);
@@ -66,7 +93,7 @@ void setup()
     
     if (!check_fixed_pattern(0x5A698421)) return;
     if (!check_lfsr_pattern(2976674124ul)) return;
-    if (!check_lfsr_pattern(1438200953ul)) return;
+    if (!check_lfsr_pattern(1438200953ul, SOME_TESTS_USE_DMA)) return;
     if (!check_lfsr_pattern(3413783263ul)) return;
     if (!check_lfsr_pattern(1900517911ul)) return;
     if (!check_lfsr_pattern(1227909400ul)) return;
@@ -109,7 +136,7 @@ void setup()
     if (!check_lfsr_pattern(85016565ul)) return;
     if (!check_lfsr_pattern(1427530695ul)) return;
     if (!check_lfsr_pattern(1100533073ul)) return;
-    if (!check_fixed_pattern(0x55555555)) return;
+    if (!check_fixed_pattern(0x55555555, SOME_TESTS_USE_DMA)) return;
     if (!check_fixed_pattern(0x33333333)) return;
     if (!check_fixed_pattern(0x0F0F0F0F)) return;
     if (!check_fixed_pattern(0x00FF00FF)) return;
@@ -121,7 +148,7 @@ void setup()
     if (!check_fixed_pattern(0xFFFF0000)) return;
     if (!check_fixed_pattern(0xFFFFFFFF)) return;
     if (!check_fixed_pattern(0x00000000)) return;
-    Serial.printf(" test ran for %.2f seconds\n", (float)msec / 1000.0f);
+    Serial.printf(" %d tests took %.2f seconds\n", test_count, (float)msec / 1000.0f);
     Serial.println("All memory tests passed :-)");
     memory_ok = true;
 }
@@ -137,8 +164,75 @@ void setup()
 ///////////////////////////////////////////////////////////////////
 uint32_t reg;
 
-#define BLK_SIZE 255 // 255*uint32_t is 1020 bytes
-uint32_t regMulti[2][BLK_SIZE];
+//#define BLK_SIZE 255 // 255*uint32_t is 1020 bytes
+#define BLK_SIZE 511 // 511*uint32_t is 2044 bytes
+#define ROUNDED_BLK_SIZE ((BLK_SIZE+7) & 0xFFFF'FFF8)
+uint32_t regMulti[2][ROUNDED_BLK_SIZE] __attribute__((aligned(32)));
+
+///////////////////////////////////////////////////////////////////
+// Wrap the memcpy() so we can choose to use the CPU or DMA,
+// which allows us to check DMA access to PSRAM, and also to
+// check a buffer while copying another one 
+///////////////////////////////////////////////////////////////////
+DMAChannel copyDMA; // create and allocate DMA channel to use for memory copying
+bool usingDMA;
+void* dest;
+size_t size;
+uint32_t copyTimer;
+float theCopyTime = 12345.67f;
+
+
+// memcpy time in microseconds
+void setTheCopyTime(uint32_t endTime) { theCopyTime = (float)(endTime - copyTimer) / F_CPU_ACTUAL * 1'000'000.0f; }
+
+void* xmemcpy(void* dst, const void* src, size_t sz, bool useDMA = true)
+{
+  void * result = nullptr;
+
+  if (!useDMA)
+  {
+    copyTimer = ARM_DWT_CYCCNT;
+    result = memcpy(dst,src,sz);
+    setTheCopyTime(ARM_DWT_CYCCNT);
+    usingDMA = false;
+  }
+  else
+  {
+    // this assumes we're transferring 32-bit values!
+    dest = dst; // store for cache clearance later
+    size = sz;
+
+    arm_dcache_flush((void*) src,size); // flush source out of cache to RAM
+    arm_dcache_delete(dest,size); // delete cache record of destination contents
+    copyDMA.destinationBuffer((uint32_t*) dst, sz);
+    copyDMA.sourceBuffer((uint32_t*) src, sz);
+    copyDMA.enable();
+    copyDMA.disableOnCompletion();
+    copyTimer = ARM_DWT_CYCCNT;
+    copyDMA.triggerContinuously();
+    usingDMA = true;
+  }    
+
+  return result;    
+}
+
+bool copyIsComplete(void) 
+{ 
+  bool result = true;
+
+  if (usingDMA)
+  {
+    if (copyDMA.complete())
+    {
+      setTheCopyTime(ARM_DWT_CYCCNT);
+    }
+    else
+      result = false;
+  }
+
+  return result;
+}
+
 
 bool new_fail_message(uint32_t* pm, volatile uint32_t *location, int count, int which)
 {
@@ -179,10 +273,13 @@ void nextRegFixed(uint32_t pattern)
 }
 
 
-bool check_fixed_pattern(uint32_t pattern)
+bool check_fixed_pattern(uint32_t pattern, bool useDMA)
 {
   volatile uint32_t *p;
-  Serial.printf("testing with fixed pattern %08X\n", pattern);
+  int copyTimeState = 0;
+  test_count++;
+  Serial.printf("test %d with fixed pattern %08X%s", test_count, pattern, useDMA?", using DMA":"");
+
 
   p = memory_begin;
   nextRegFixed(pattern); // do once, value is fixed
@@ -194,7 +291,13 @@ bool check_fixed_pattern(uint32_t pattern)
     if (count > BLK_SIZE)
       count = BLK_SIZE;
 
-    memcpy((void*) p, regMulti[which], count * sizeof *p);
+    xmemcpy((void*) p, regMulti[which], count * sizeof *p, useDMA);
+    while (!copyIsComplete()) {}
+    if (0 == copyTimeState)
+    {
+      copyTimeState++;
+      Serial.printf("; copy to memory at %.2fMB/s", BLK_SIZE*4 / theCopyTime);
+    }
 
     p += count;
     which = 1-which;
@@ -213,7 +316,15 @@ bool check_fixed_pattern(uint32_t pattern)
 
     if (count > BLK_SIZE)
       count = BLK_SIZE;
-    memcpy(memBuff, (void*) p, count * sizeof *p);
+
+    xmemcpy(memBuff, (void*) p, count * sizeof *p, useDMA);
+    while (!copyIsComplete()) {}
+    if (1 == copyTimeState)
+    {
+      copyTimeState++;
+      Serial.printf("; from memory at %.2fMB/s\n", BLK_SIZE*4 / theCopyTime);
+    }
+
     cmpres = memcmp(memBuff, regMulti[which], count * sizeof *p);
     p += count;
 
@@ -249,12 +360,14 @@ void nextRegMulti(int which)
 }
 
 
-bool check_lfsr_pattern(uint32_t seed)
+bool check_lfsr_pattern(uint32_t seed, bool useDMA)
 {
   volatile uint32_t *p;
   int which = 0;
+  int copyTimeState = 0;
 
-  Serial.printf("testing with pseudo-random sequence, seed=%u\n", seed);
+  test_count++;
+  Serial.printf("test %d with pseudo-random sequence, seed=%u%s", test_count, seed, useDMA?", using DMA":"");
   reg = seed;
   p = memory_begin;
   while (p < memory_end)
@@ -263,7 +376,15 @@ bool check_lfsr_pattern(uint32_t seed)
     int count = memory_end - p;
     if (count > BLK_SIZE)
       count = BLK_SIZE;
-    memcpy((void*) p, regMulti[which], count * sizeof *p);
+
+    xmemcpy((void*) p, regMulti[which], count * sizeof *p, useDMA);
+    while (!copyIsComplete()) {}
+    if (0 == copyTimeState)
+    {
+      copyTimeState++;
+      Serial.printf("; copy to memory at %.2fMB/s",BLK_SIZE*4 / theCopyTime);
+    }
+
     p += count;
     which = 1-which;
   }
@@ -284,7 +405,15 @@ bool check_lfsr_pattern(uint32_t seed)
     if (count >= BLK_SIZE)
       count = BLK_SIZE;
     const int sz = count * sizeof *p;
-    memcpy(memBuff, (void*) p, sz);
+
+    xmemcpy(memBuff, (void*) p, sz, useDMA);
+    while (!copyIsComplete()) {}
+    if (1 == copyTimeState)
+    {
+      copyTimeState++;
+      Serial.printf("; from memory at %.2fMB/s\n",BLK_SIZE*4 / theCopyTime);
+    }
+
     cmpres = memcmp(memBuff, regMulti[which], sz);
     p += count;
     if (0 != cmpres) return new_fail_message(memBuff, p - count, count, which);
